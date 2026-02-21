@@ -1,5 +1,15 @@
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1'
 
+function normalizeApiKey(raw) {
+  const value = (raw || '').trim()
+  if (!value) return ''
+  const lowered = value.toLowerCase()
+  if (lowered === 'replace-me' || lowered === 'changeme' || lowered === 'your_api_key') {
+    return ''
+  }
+  return value
+}
+
 function fallbackByLang(lang) {
   if (lang.startsWith('en')) {
     return "I'm having trouble reaching my language model right now. I can still summarize my key projects if you want."
@@ -11,7 +21,7 @@ function fallbackByLang(lang) {
 export async function generateAssistantReply({ systemPrompt, userText, lang }) {
   const provider = process.env.LLM_PROVIDER || 'openai-compatible'
   const model = process.env.LLM_MODEL || 'gpt-4o-mini'
-  const apiKey = process.env.LLM_API_KEY || ''
+  const apiKey = normalizeApiKey(process.env.LLM_API_KEY) || normalizeApiKey(process.env.GROQ_API_KEY)
   const baseUrl = (process.env.LLM_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, '')
 
   if (!apiKey) {

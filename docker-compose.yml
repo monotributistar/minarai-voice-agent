@@ -35,10 +35,6 @@ services:
       WHISPER_DEVICE: cuda
     ports:
       - "9001:9001"
-    device_requests:
-      - driver: nvidia
-        count: 1
-        capabilities: [gpu]
     deploy:
       resources:
         reservations:

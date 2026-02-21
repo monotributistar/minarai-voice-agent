@@ -11,8 +11,8 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="minarai-tts", version="0.1.0")
 
 PIPER_BIN = os.getenv("PIPER_BIN", "/opt/piper/piper")
-PIPER_VOICE_ES = os.getenv("PIPER_VOICE_ES", "/app/voices/es/model.onnx")
-PIPER_VOICE_EN = os.getenv("PIPER_VOICE_EN", "/app/voices/en/model.onnx")
+PIPER_VOICE_ES = os.getenv("PIPER_VOICE_ES", "/app/voices/es/es_ES-sharvard-medium.onnx")
+PIPER_VOICE_EN = os.getenv("PIPER_VOICE_EN", "/app/voices/en/en_US-joe-medium.onnx")
 
 
 class SpeakRequest(BaseModel):
@@ -20,17 +20,39 @@ class SpeakRequest(BaseModel):
     voice: Literal["es", "en"] = "es"
 
 
+def _fallback_voice_path(voice: str):
+    directory = Path("/app/voices/en" if voice == "en" else "/app/voices/es")
+    if not directory.exists():
+        return None
+    candidates = sorted(
+        p for p in directory.glob("*.onnx") if p.is_file() and p.name.endswith(".onnx")
+    )
+    return str(candidates[0]) if candidates else None
+
+
 def _voice_path(voice: str) -> str:
-    return PIPER_VOICE_EN if voice == "en" else PIPER_VOICE_ES
+    configured = PIPER_VOICE_EN if voice == "en" else PIPER_VOICE_ES
+    if Path(configured).exists():
+        return configured
+    fallback = _fallback_voice_path(voice)
+    if fallback:
+        return fallback
+    return configured
 
 
 @app.get("/health")
 def health() -> dict[str, object]:
+    selected_es = _voice_path("es")
+    selected_en = _voice_path("en")
     return {
         "ok": True,
         "piper_bin": PIPER_BIN,
         "voice_es_exists": Path(PIPER_VOICE_ES).exists(),
         "voice_en_exists": Path(PIPER_VOICE_EN).exists(),
+        "voice_es_selected": selected_es,
+        "voice_en_selected": selected_en,
+        "voice_es_selected_exists": Path(selected_es).exists(),
+        "voice_en_selected_exists": Path(selected_en).exists(),
     }
 
 

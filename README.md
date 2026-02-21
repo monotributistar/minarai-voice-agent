@@ -1,11 +1,15 @@
-# Voice Agent MVP (local STT + TTS, external LLM)
+# Voice Agent MVP (Groq STT + Groq LLM + Groq/API or local Piper TTS)
 
 This folder adds a local voice-agent stack for the portfolio:
 
 - Frontend (React + Vite): push-to-talk panel over WebSocket
 - Orchestrator (Node): audio conversion + STT + LLM + TTS pipeline
-- STT (FastAPI + faster-whisper): local transcription (`/transcribe`)
-- TTS (FastAPI + Piper CLI): local speech synthesis (`/speak`)
+- STT:
+  - Groq Whisper API (`STT_PROVIDER=groq`) recommended for trial quota tests
+  - Optional local fallback (FastAPI + faster-whisper) with Docker profiles
+- TTS:
+  - Groq API (`TTS_PROVIDER=groq`) for quick POC
+  - Local Piper fallback (`TTS_PROVIDER=local`)
 
 ## Services and ports
 
@@ -45,14 +49,39 @@ If this fails, typical fixes:
 cp voice-agent/.env.example voice-agent/.env
 ```
 
-### GPU profile (recommended on RTX 3070)
+### Mode A: Groq STT + Groq LLM (fastest MVP path)
+
+Set in `.env`:
+
+- `STT_PROVIDER=groq`
+- `TTS_PROVIDER=groq`
+- `LLM_BASE_URL=https://api.groq.com/openai/v1`
+- `LLM_MODEL=llama-3.1-8b-instant` (or your preferred Groq model)
+- `LLM_API_KEY=<your_groq_key>`
+- `GROQ_API_KEY=<your_groq_key>` (optional if `LLM_API_KEY` already set)
+
+Groq TTS notes:
+
+- Endpoint: `/audio/speech`
+- Current voice model support is mainly English for `playai-tts`.
+- For Spanish requests, set `GROQ_TTS_NON_EN_STRATEGY=local` to auto-fallback to Piper.
+- `GROQ_TTS_INPUT_MAX_CHARS` defaults to `180` for reliable MVP behavior.
+
+Run:
+
+```bash
+cd voice-agent
+docker compose up --build
+```
+
+### Mode B: local faster-whisper STT (GPU profile, RTX 3070)
 
 ```bash
 cd voice-agent
 docker compose --profile gpu up --build
 ```
 
-### CPU fallback profile
+### Mode C: local faster-whisper STT (CPU fallback profile)
 
 ```bash
 cd voice-agent
@@ -65,7 +94,7 @@ In another terminal (repo root):
 pnpm dev
 ```
 
-## Piper voices
+## Piper voices (used when `TTS_PROVIDER=local` or fallback)
 
 Put Piper models in `voice-agent/tts/voices` and match paths in `.env`:
 
@@ -124,11 +153,16 @@ Per request:
 
 1. Receive `audio/webm;codecs=opus` blob from browser.
 2. Convert with ffmpeg to WAV PCM 16kHz mono.
-3. STT `POST /transcribe` (multipart file).
-4. Build persona prompt + optional CMS grounding snippets.
-5. Call external LLM API (OpenAI-compatible chat-completions adapter).
-6. Post-process assistant text for short TTS-friendly response.
-7. TTS `POST /speak` and return WAV via WebSocket.
+3. STT:
+   - `STT_PROVIDER=groq`: `POST https://api.groq.com/openai/v1/audio/transcriptions`
+   - `STT_PROVIDER=local`: `POST /transcribe` to local STT service
+4. TTS:
+   - `TTS_PROVIDER=groq`: `POST https://api.groq.com/openai/v1/audio/speech`
+   - `TTS_PROVIDER=local`: `POST /speak` to local Piper wrapper
+5. Build persona prompt + optional CMS grounding snippets.
+6. Call external LLM API (OpenAI-compatible chat-completions adapter).
+7. Post-process assistant text for short TTS-friendly response.
+8. Return WAV via WebSocket.
 
 Orchestrator logs include per request:
 

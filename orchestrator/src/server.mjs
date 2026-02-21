@@ -8,8 +8,23 @@ import { generateAssistantReply } from './llm.mjs'
 import { buildGroundingText, buildSystemPrompt, postProcessForTts } from './persona.mjs'
 
 const PORT = Number(process.env.PORT || 8787)
+
+const STT_PROVIDER = (process.env.STT_PROVIDER || 'local').toLowerCase()
 const STT_URL = process.env.STT_URL || 'http://stt:9001/transcribe'
+
+const TTS_PROVIDER = (process.env.TTS_PROVIDER || 'local').toLowerCase()
 const TTS_URL = process.env.TTS_URL || 'http://tts:9002/speak'
+
+const GROQ_API_KEY = process.env.GROQ_API_KEY || process.env.LLM_API_KEY || ''
+const GROQ_STT_URL =
+  process.env.GROQ_STT_URL || 'https://api.groq.com/openai/v1/audio/transcriptions'
+const GROQ_STT_MODEL = process.env.GROQ_STT_MODEL || 'whisper-large-v3-turbo'
+const GROQ_TTS_URL = process.env.GROQ_TTS_URL || 'https://api.groq.com/openai/v1/audio/speech'
+const GROQ_TTS_MODEL = process.env.GROQ_TTS_MODEL || 'playai-tts'
+const GROQ_TTS_VOICE = process.env.GROQ_TTS_VOICE || 'Fritz-PlayAI'
+const GROQ_TTS_INPUT_MAX_CHARS = Number(process.env.GROQ_TTS_INPUT_MAX_CHARS || 180)
+const GROQ_TTS_NON_EN_STRATEGY = (process.env.GROQ_TTS_NON_EN_STRATEGY || 'local').toLowerCase()
+
 const MAX_AUDIO_BYTES = Number(process.env.MAX_AUDIO_BYTES || 8 * 1024 * 1024)
 const MAX_AUDIO_SECONDS = Number(process.env.MAX_AUDIO_SECONDS || 30)
 const TMP_DIR = process.env.TMP_DIR || '/tmp'
@@ -19,7 +34,6 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .filter(Boolean)
 
 const wss = new WebSocketServer({ port: PORT })
-
 const connectionState = new WeakMap()
 
 function nowMs() {
@@ -58,7 +72,15 @@ function execCmd(command, args) {
 
 async function getAudioDurationSeconds(filePath) {
   return new Promise((resolve, reject) => {
-    const args = ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nokey=1:noprint_wrappers=1', filePath]
+    const args = [
+      '-v',
+      'error',
+      '-show_entries',
+      'format=duration',
+      '-of',
+      'default=nokey=1:noprint_wrappers=1',
+      filePath,
+    ]
     const child = spawn('ffprobe', args)
     let output = ''
     let stderr = ''
@@ -90,10 +112,21 @@ async function getAudioDurationSeconds(filePath) {
 }
 
 async function convertToWav(inputPath, outputPath) {
-  await execCmd('ffmpeg', ['-y', '-i', inputPath, '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', outputPath])
+  await execCmd('ffmpeg', [
+    '-y',
+    '-i',
+    inputPath,
+    '-ac',
+    '1',
+    '-ar',
+    '16000',
+    '-c:a',
+    'pcm_s16le',
+    outputPath,
+  ])
 }
 
-async function transcribeWav(buffer, requestId) {
+async function transcribeWavLocal(buffer, requestId) {
   const blob = new Blob([buffer], { type: 'audio/wav' })
   const form = new FormData()
   form.append('file', blob, `${requestId}.wav`)
@@ -111,7 +144,56 @@ async function transcribeWav(buffer, requestId) {
   return response.json()
 }
 
-async function synthesizeSpeech(text, lang) {
+async function transcribeWavGroq(buffer, requestId, lang) {
+  if (!GROQ_API_KEY) {
+    throw new Error('STT_PROVIDER=groq but GROQ_API_KEY (or LLM_API_KEY) is missing')
+  }
+
+  const blob = new Blob([buffer], { type: 'audio/wav' })
+  const form = new FormData()
+  form.append('file', blob, `${requestId}.wav`)
+  form.append('model', GROQ_STT_MODEL)
+  form.append('response_format', 'verbose_json')
+  form.append('language', lang.startsWith('en') ? 'en' : 'es')
+
+  const response = await fetch(GROQ_STT_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
+    body: form,
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`Groq STT error ${response.status}: ${errorText.slice(0, 400)}`)
+  }
+
+  const json = await response.json()
+  const segments =
+    Array.isArray(json?.segments) && json.segments.length > 0
+      ? json.segments.map((segment) => ({
+          start: Number(segment.start || 0),
+          end: Number(segment.end || 0),
+          text: String(segment.text || '').trim(),
+        }))
+      : []
+
+  return {
+    text: String(json?.text || '').trim(),
+    language: String(json?.language || ''),
+    segments,
+  }
+}
+
+async function transcribeWav(buffer, requestId, lang = 'es-AR') {
+  if (STT_PROVIDER === 'groq') {
+    return transcribeWavGroq(buffer, requestId, lang)
+  }
+  return transcribeWavLocal(buffer, requestId)
+}
+
+async function synthesizeSpeechLocal(text, lang) {
   const voice = lang.startsWith('en') ? 'en' : 'es'
   const response = await fetch(TTS_URL, {
     method: 'POST',
@@ -127,6 +209,50 @@ async function synthesizeSpeech(text, lang) {
   }
 
   return Buffer.from(await response.arrayBuffer())
+}
+
+async function synthesizeSpeechGroq(text, lang) {
+  if (!GROQ_API_KEY) {
+    throw new Error('TTS_PROVIDER=groq but GROQ_API_KEY (or LLM_API_KEY) is missing')
+  }
+
+  const isEnglish = lang.startsWith('en')
+  const fallbackLocal = !isEnglish && GROQ_TTS_NON_EN_STRATEGY === 'local'
+  if (fallbackLocal) {
+    console.warn(
+      `[tts] Non-English request (${lang}) with Groq TTS. Falling back to local TTS because GROQ_TTS_NON_EN_STRATEGY=local.`,
+    )
+    return synthesizeSpeechLocal(text, lang)
+  }
+
+  const input = text.slice(0, Math.max(1, GROQ_TTS_INPUT_MAX_CHARS)).trim()
+  const response = await fetch(GROQ_TTS_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_TTS_MODEL,
+      voice: GROQ_TTS_VOICE,
+      input,
+      response_format: 'wav',
+    }),
+  })
+
+  if (!response.ok) {
+    const err = await response.text()
+    throw new Error(`Groq TTS error ${response.status}: ${err.slice(0, 400)}`)
+  }
+
+  return Buffer.from(await response.arrayBuffer())
+}
+
+async function synthesizeSpeech(text, lang) {
+  if (TTS_PROVIDER === 'groq') {
+    return synthesizeSpeechGroq(text, lang)
+  }
+  return synthesizeSpeechLocal(text, lang)
 }
 
 function shouldGroundProjects(query = '') {
@@ -175,7 +301,7 @@ async function processAudioRequest(ws, state, payload) {
     logStep(requestId, 'ffmpeg_done', stamps.ffmpeg_done)
 
     const wavBuffer = await fs.readFile(wavPath)
-    const sttResult = await transcribeWav(wavBuffer, requestId)
+    const sttResult = await transcribeWav(wavBuffer, requestId, lang)
     stamps.stt_done = nowMs()
     logStep(requestId, 'stt_done', stamps.stt_done)
 
@@ -292,7 +418,10 @@ wss.on('connection', (ws, req) => {
       }
 
       if (!state.pendingMeta) {
-        sendJson(ws, { type: 'error', message: 'Binary audio received without preceding audio_meta frame.' })
+        sendJson(ws, {
+          type: 'error',
+          message: 'Binary audio received without preceding audio_meta frame.',
+        })
         return
       }
 
