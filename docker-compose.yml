@@ -1,0 +1,65 @@
+services:
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    env_file:
+      - ./.env
+    environment:
+      CMS_DIR: /app/cms
+    volumes:
+      - ../src/cms:/app/cms:ro
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+
+  stt:
+    profiles: ["cpu"]
+    build:
+      context: ./stt
+      dockerfile: Dockerfile.cpu
+    env_file:
+      - ./.env
+    ports:
+      - "9001:9001"
+    restart: unless-stopped
+
+  stt-gpu:
+    profiles: ["gpu"]
+    build:
+      context: ./stt
+      dockerfile: Dockerfile.gpu
+    env_file:
+      - ./.env
+    environment:
+      WHISPER_DEVICE: cuda
+    ports:
+      - "9001:9001"
+    device_requests:
+      - driver: nvidia
+        count: 1
+        capabilities: [gpu]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      default:
+        aliases:
+          - stt
+    restart: unless-stopped
+
+  tts:
+    build:
+      context: ./tts
+      dockerfile: Dockerfile
+    env_file:
+      - ./.env
+    ports:
+      - "9002:9002"
+    volumes:
+      - ./tts/voices:/app/voices
+    restart: unless-stopped
