@@ -14,6 +14,13 @@ const STT_URL = process.env.STT_URL || 'http://stt:9001/transcribe'
 
 const TTS_PROVIDER = (process.env.TTS_PROVIDER || 'local').toLowerCase()
 const TTS_URL = process.env.TTS_URL || 'http://tts:9002/speak'
+const F5_TTS_URL = process.env.F5_TTS_URL || 'http://tts-f5:9003/speak'
+const F5_TTS_TIMEOUT_MS = Number(process.env.F5_TTS_TIMEOUT_MS || 120000)
+const TTS_NODE_TIMEOUT_MS = Number(process.env.TTS_NODE_TIMEOUT_MS || 15000)
+const TTS_PROVIDER_REGISTRY = (process.env.TTS_PROVIDER_REGISTRY || 'local,groq,f5')
+  .split(',')
+  .map((item) => item.trim().toLowerCase())
+  .filter(Boolean)
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || process.env.LLM_API_KEY || ''
 const GROQ_STT_URL =
@@ -35,6 +42,14 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
 
 const wss = new WebSocketServer({ port: PORT })
 const connectionState = new WeakMap()
+const providerState = new Map()
+
+for (const provider of new Set([...TTS_PROVIDER_REGISTRY, 'local', 'groq', 'f5'])) {
+  providerState.set(provider, {
+    id: provider,
+    enabled: provider === TTS_PROVIDER || TTS_PROVIDER_REGISTRY.includes(provider),
+  })
+}
 
 function nowMs() {
   return Date.now()
@@ -48,6 +63,277 @@ function sendJson(ws, payload) {
 
 function logStep(requestId, step, ts) {
   console.log(`[${requestId}] ${step}=${ts}`)
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value))
+}
+
+function toNumber(value) {
+  const num = Number(value)
+  return Number.isFinite(num) ? num : null
+}
+
+function withTimeoutSignal(timeoutMs = 5000) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), Math.max(500, timeoutMs))
+  return { signal: controller.signal, cancel: () => clearTimeout(timer) }
+}
+
+function getProviderHealthUrl(provider) {
+  if (provider === 'f5') return F5_TTS_URL.replace(/\/speak$/, '/health')
+  return TTS_URL.replace(/\/speak$/, '/health')
+}
+
+function getProviderSpeakUrl(provider) {
+  return provider === 'f5' ? F5_TTS_URL : TTS_URL
+}
+
+async function fetchJson(url, timeoutMs = 5000) {
+  const { signal, cancel } = withTimeoutSignal(timeoutMs)
+  try {
+    const response = await fetch(url, { signal })
+    if (!response.ok) {
+      const text = await response.text()
+      throw new Error(`HTTP ${response.status}: ${text.slice(0, 240)}`)
+    }
+    return await response.json()
+  } finally {
+    cancel()
+  }
+}
+
+function normalizeTtsNodeConfig(raw, lang) {
+  const defaultVoice = lang.startsWith('en') ? 'en' : 'es'
+  const speed = clamp(toNumber(raw?.prosody?.speed) ?? 1, 0.7, 1.4)
+  const lengthScale = clamp(1 / speed, 0.7, 1.6)
+  const pitch = clamp(toNumber(raw?.prosody?.pitch) ?? 0, -1, 1)
+  const energy = clamp(toNumber(raw?.prosody?.energy) ?? 0.8, 0, 1)
+  const pauseMs = clamp(toNumber(raw?.prosody?.pause_ms) ?? 120, 0, 500)
+  const temperature = clamp(toNumber(raw?.generation?.temperature) ?? 0.6, 0, 1)
+  const maxChars = clamp(
+    Math.floor(toNumber(raw?.constraints?.max_chars) ?? GROQ_TTS_INPUT_MAX_CHARS),
+    60,
+    900,
+  )
+
+  return {
+    provider: raw?.provider ? String(raw.provider).toLowerCase() : null,
+    instanceId: raw?.instance_id ? String(raw.instance_id) : null,
+    voice: String(raw?.voice || defaultVoice),
+    style: String(raw?.style || 'friendly_direct'),
+    prosody: {
+      speed,
+      pitch,
+      energy,
+      pauseMs,
+      lengthScale,
+      noiseScale: clamp(0.3 + (1 - energy) * 0.4, 0.1, 1),
+      noiseW: clamp(0.6 - pitch * 0.15, 0.2, 1),
+      sentenceSilence: clamp(pauseMs / 1000, 0, 1),
+    },
+    generation: {
+      temperature,
+      stability: clamp(toNumber(raw?.generation?.stability) ?? 0.75, 0, 1),
+      seed: Math.floor(toNumber(raw?.generation?.seed) ?? 42),
+      model: String(raw?.generation?.model || GROQ_TTS_MODEL),
+      providerVoice: String(raw?.generation?.provider_voice || GROQ_TTS_VOICE),
+    },
+    audio: {
+      format: String(raw?.audio?.format || 'wav'),
+      sampleRate: Math.floor(toNumber(raw?.audio?.sample_rate) ?? 22050),
+    },
+    constraints: {
+      maxChars,
+    },
+  }
+}
+
+async function getProviderStatus() {
+  const statuses = []
+  const providers = [...providerState.keys()]
+  for (const provider of providers) {
+    const item = providerState.get(provider)
+    let healthy = false
+    let info = null
+    try {
+      const health = await fetchJson(getProviderHealthUrl(provider), 2500)
+      healthy = Boolean(health?.ok)
+      info = health
+    } catch (error) {
+      healthy = false
+      info = { error: error instanceof Error ? error.message : String(error) }
+    }
+    statuses.push({
+      id: provider,
+      enabled: Boolean(item?.enabled),
+      healthy,
+      info,
+    })
+  }
+  return statuses
+}
+
+async function resolveActiveProvider(preferredProvider = null) {
+  const normalizedPreferred = preferredProvider ? String(preferredProvider).toLowerCase() : null
+  const statuses = await getProviderStatus()
+  if (normalizedPreferred) {
+    const preferred = statuses.find((item) => item.id === normalizedPreferred)
+    if (preferred?.enabled) {
+      return { provider: preferred.id, statuses }
+    }
+  }
+
+  const firstHealthyEnabled = statuses.find((item) => item.enabled && item.healthy)
+  if (firstHealthyEnabled) {
+    return { provider: firstHealthyEnabled.id, statuses }
+  }
+
+  const firstEnabled = statuses.find((item) => item.enabled)
+  if (firstEnabled) {
+    return { provider: firstEnabled.id, statuses }
+  }
+
+  throw new Error('No active TTS providers enabled. Enable at least one provider in debug panel.')
+}
+
+function getNodeTtsBaseUrl(provider = TTS_PROVIDER) {
+  if (provider === 'f5') return F5_TTS_URL.replace(/\/speak$/, '')
+  return TTS_URL.replace(/\/speak$/, '')
+}
+
+function isNodeTtsProvider(provider = TTS_PROVIDER) {
+  return provider === 'local' || provider === 'f5' || provider === 'groq'
+}
+
+function getNodeProviderRoute(provider = TTS_PROVIDER) {
+  if (provider === 'f5') return 'f5'
+  if (provider === 'local' || provider === 'groq') return 'tts'
+  return 'tts'
+}
+
+async function fetchJsonWithMethod(url, method = 'GET', payload = null, timeoutMs = 5000) {
+  const { signal, cancel } = withTimeoutSignal(timeoutMs)
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: payload ? { 'Content-Type': 'application/json' } : undefined,
+      body: payload ? JSON.stringify(payload) : undefined,
+      signal,
+    })
+    if (!response.ok) {
+      const text = await response.text()
+      throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`)
+    }
+    return await response.json()
+  } finally {
+    cancel()
+  }
+}
+
+async function getNodeConfig(provider = TTS_PROVIDER) {
+  if (!isNodeTtsProvider(provider)) {
+    throw new Error(`Provider ${provider} does not expose node config endpoints`)
+  }
+  const baseUrl = getNodeTtsBaseUrl(provider)
+  return fetchJsonWithMethod(`${baseUrl}/config`, 'GET', null, 6000)
+}
+
+async function updateNodeConfig(provider = TTS_PROVIDER, configPayload = {}) {
+  if (!isNodeTtsProvider(provider)) {
+    throw new Error(`Provider ${provider} does not expose node config endpoints`)
+  }
+  const baseUrl = getNodeTtsBaseUrl(provider)
+  return fetchJsonWithMethod(`${baseUrl}/config`, 'PUT', configPayload, 6000)
+}
+
+async function setNodeEphemeral(provider = TTS_PROVIDER, ephemeralPayload = {}) {
+  if (!isNodeTtsProvider(provider)) {
+    throw new Error(`Provider ${provider} does not expose node config endpoints`)
+  }
+  const baseUrl = getNodeTtsBaseUrl(provider)
+  return fetchJsonWithMethod(`${baseUrl}/config/ephemeral`, 'POST', ephemeralPayload, 6000)
+}
+
+async function clearNodeEphemeral(provider = TTS_PROVIDER) {
+  if (!isNodeTtsProvider(provider)) {
+    throw new Error(`Provider ${provider} does not expose node config endpoints`)
+  }
+  const baseUrl = getNodeTtsBaseUrl(provider)
+  return fetchJsonWithMethod(`${baseUrl}/config/ephemeral`, 'DELETE', null, 6000)
+}
+
+async function getTtsDebugSnapshot(ttsConfig) {
+  const statuses = await getProviderStatus()
+  const snapshot = {
+    ok: true,
+    ttsProvider: TTS_PROVIDER,
+    ttsProviders: statuses,
+    ttsService: {
+      healthy: false,
+      details: null,
+    },
+    ttsInstances: [],
+    activeTtsConfig: {
+      instance_id: ttsConfig.instanceId || undefined,
+      voice: ttsConfig.voice,
+      style: ttsConfig.style,
+      prosody: {
+        speed: ttsConfig.prosody.speed,
+        pitch: ttsConfig.prosody.pitch,
+        energy: ttsConfig.prosody.energy,
+        pause_ms: ttsConfig.prosody.pauseMs,
+      },
+      generation: {
+        temperature: ttsConfig.generation.temperature,
+        stability: ttsConfig.generation.stability,
+        seed: ttsConfig.generation.seed,
+        model: ttsConfig.generation.model,
+        provider_voice: ttsConfig.generation.providerVoice,
+      },
+      audio: {
+        format: ttsConfig.audio.format,
+        sample_rate: ttsConfig.audio.sampleRate,
+      },
+      constraints: {
+        max_chars: ttsConfig.constraints.maxChars,
+      },
+    },
+  }
+
+  const enabledProvider = statuses.find((item) => item.enabled)
+  const effectiveProvider = enabledProvider ? enabledProvider.id : TTS_PROVIDER
+
+  if (!isNodeTtsProvider(effectiveProvider)) {
+    snapshot.ttsService.healthy = true
+    snapshot.ttsService.details = {
+      info: `provider=${effectiveProvider} (local instance list not required)`,
+    }
+    return snapshot
+  }
+
+  try {
+    const baseUrl = getNodeTtsBaseUrl(effectiveProvider)
+    const [health, instancesResponse, configResponse] = await Promise.all([
+      fetchJson(`${baseUrl}/health`, 6000),
+      fetchJson(`${baseUrl}/instances`, 6000),
+      fetchJson(`${baseUrl}/config`, 6000),
+    ])
+
+    snapshot.ttsService.healthy = Boolean(health?.ok)
+    snapshot.ttsService.details = health
+    snapshot.ttsInstances = Array.isArray(instancesResponse?.instances)
+      ? instancesResponse.instances
+      : []
+    snapshot.nodeConfig = configResponse?.config || null
+    snapshot.nodeRoute = getNodeProviderRoute(effectiveProvider)
+    return snapshot
+  } catch (error) {
+    snapshot.ok = false
+    snapshot.ttsService.healthy = false
+    snapshot.error = error instanceof Error ? error.message : 'debug snapshot failed'
+    return snapshot
+  }
 }
 
 function execCmd(command, args) {
@@ -193,14 +479,22 @@ async function transcribeWav(buffer, requestId, lang = 'es-AR') {
   return transcribeWavLocal(buffer, requestId)
 }
 
-async function synthesizeSpeechLocal(text, lang) {
-  const voice = lang.startsWith('en') ? 'en' : 'es'
+async function synthesizeSpeechLocal(text, lang, ttsConfig) {
+  const voice = ttsConfig.voice.startsWith('en') ? 'en' : lang.startsWith('en') ? 'en' : 'es'
   const response = await fetch(TTS_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ text, voice }),
+    body: JSON.stringify({
+      text,
+      voice,
+      instance_id: ttsConfig.instanceId,
+      length_scale: ttsConfig.prosody.lengthScale,
+      noise_scale: ttsConfig.prosody.noiseScale,
+      noise_w: ttsConfig.prosody.noiseW,
+      sentence_silence: ttsConfig.prosody.sentenceSilence,
+    }),
   })
 
   if (!response.ok) {
@@ -211,7 +505,7 @@ async function synthesizeSpeechLocal(text, lang) {
   return Buffer.from(await response.arrayBuffer())
 }
 
-async function synthesizeSpeechGroq(text, lang) {
+async function synthesizeSpeechGroq(text, lang, ttsConfig) {
   if (!GROQ_API_KEY) {
     throw new Error('TTS_PROVIDER=groq but GROQ_API_KEY (or LLM_API_KEY) is missing')
   }
@@ -222,10 +516,10 @@ async function synthesizeSpeechGroq(text, lang) {
     console.warn(
       `[tts] Non-English request (${lang}) with Groq TTS. Falling back to local TTS because GROQ_TTS_NON_EN_STRATEGY=local.`,
     )
-    return synthesizeSpeechLocal(text, lang)
+    return synthesizeSpeechLocal(text, lang, ttsConfig)
   }
 
-  const input = text.slice(0, Math.max(1, GROQ_TTS_INPUT_MAX_CHARS)).trim()
+  const input = text.slice(0, Math.max(1, ttsConfig.constraints.maxChars)).trim()
   const response = await fetch(GROQ_TTS_URL, {
     method: 'POST',
     headers: {
@@ -233,10 +527,10 @@ async function synthesizeSpeechGroq(text, lang) {
       Authorization: `Bearer ${GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: GROQ_TTS_MODEL,
-      voice: GROQ_TTS_VOICE,
+      model: ttsConfig.generation.model || GROQ_TTS_MODEL,
+      voice: ttsConfig.generation.providerVoice || GROQ_TTS_VOICE,
       input,
-      response_format: 'wav',
+      response_format: ttsConfig.audio.format || 'wav',
     }),
   })
 
@@ -248,11 +542,84 @@ async function synthesizeSpeechGroq(text, lang) {
   return Buffer.from(await response.arrayBuffer())
 }
 
-async function synthesizeSpeech(text, lang) {
-  if (TTS_PROVIDER === 'groq') {
-    return synthesizeSpeechGroq(text, lang)
+async function synthesizeSpeechNode(
+  speakUrl,
+  nodeProvider,
+  text,
+  lang,
+  ttsConfig,
+  timeoutMs = TTS_NODE_TIMEOUT_MS,
+) {
+  const voice = ttsConfig.voice.startsWith('en') ? 'en' : lang.startsWith('en') ? 'en' : 'es'
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), Math.max(3000, timeoutMs))
+
+  try {
+    const response = await fetch(speakUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text,
+        lang,
+        provider: nodeProvider,
+        voice,
+        instance_id: ttsConfig.instanceId || null,
+        style: ttsConfig.style,
+        prosody: {
+          speed: ttsConfig.prosody.speed,
+          pitch: ttsConfig.prosody.pitch,
+          energy: ttsConfig.prosody.energy,
+          pause_ms: ttsConfig.prosody.pauseMs,
+        },
+        generation: {
+          temperature: ttsConfig.generation.temperature,
+          stability: ttsConfig.generation.stability,
+          seed: ttsConfig.generation.seed,
+          model: ttsConfig.generation.model,
+          provider_voice: ttsConfig.generation.providerVoice,
+        },
+        audio: {
+          format: ttsConfig.audio.format,
+          sample_rate: ttsConfig.audio.sampleRate,
+        },
+        constraints: {
+          max_chars: ttsConfig.constraints.maxChars,
+        },
+        length_scale: ttsConfig.prosody.lengthScale,
+        noise_scale: ttsConfig.prosody.noiseScale,
+        noise_w: ttsConfig.prosody.noiseW,
+        sentence_silence: ttsConfig.prosody.sentenceSilence,
+        speed: ttsConfig.prosody.speed,
+      }),
+      signal: controller.signal,
+    })
+
+    if (!response.ok) {
+      const err = await response.text()
+      throw new Error(`TTS node error ${response.status}: ${err.slice(0, 500)}`)
+    }
+
+    return Buffer.from(await response.arrayBuffer())
+  } finally {
+    clearTimeout(timeout)
   }
-  return synthesizeSpeechLocal(text, lang)
+}
+
+async function synthesizeSpeech(text, lang, ttsConfig) {
+  const { provider } = await resolveActiveProvider(ttsConfig.provider)
+
+  if (isNodeTtsProvider(provider)) {
+    const speakUrl = getProviderSpeakUrl(provider)
+    const timeoutMs = provider === 'f5' ? F5_TTS_TIMEOUT_MS : TTS_NODE_TIMEOUT_MS
+    return synthesizeSpeechNode(speakUrl, provider, text, lang, ttsConfig, timeoutMs)
+  }
+
+  if (provider === 'groq') {
+    return synthesizeSpeechGroq(text, lang, ttsConfig)
+  }
+  return synthesizeSpeechLocal(text, lang, ttsConfig)
 }
 
 function shouldGroundProjects(query = '') {
@@ -272,6 +639,7 @@ async function buildGrounding(lang, userText) {
 async function processAudioRequest(ws, state, payload) {
   const requestId = payload.requestId || randomUUID()
   const lang = payload.lang || 'es-AR'
+  const ttsNodeConfig = normalizeTtsNodeConfig(payload.tts, lang)
 
   const stamps = {
     audio_received: nowMs(),
@@ -325,7 +693,7 @@ async function processAudioRequest(ws, state, payload) {
       lang,
     })
 
-    const assistantText = postProcessForTts(assistantTextRaw)
+    const assistantText = postProcessForTts(assistantTextRaw).slice(0, ttsNodeConfig.constraints.maxChars)
     stamps.llm_done = nowMs()
     logStep(requestId, 'llm_done', stamps.llm_done)
 
@@ -339,7 +707,7 @@ async function processAudioRequest(ws, state, payload) {
 
     sendJson(ws, { type: 'state', requestId, state: 'speaking' })
 
-    const audioBytes = await synthesizeSpeech(assistantText, lang)
+    const audioBytes = await synthesizeSpeech(assistantText, lang, ttsNodeConfig)
     stamps.tts_done = nowMs()
     logStep(requestId, 'tts_done', stamps.tts_done)
 
@@ -395,6 +763,102 @@ wss.on('connection', (ws, req) => {
           return
         }
 
+        if (message.type === 'debug_ping') {
+          const debugLang = message.lang || 'es-AR'
+          const debugConfig = normalizeTtsNodeConfig(message.tts || null, debugLang)
+          const debugStatus = await getTtsDebugSnapshot(debugConfig)
+          sendJson(ws, {
+            type: 'debug_status',
+            requestId: message.requestId || null,
+            data: debugStatus,
+          })
+          return
+        }
+
+        if (message.type === 'provider_set') {
+          const providerId = String(message.provider || '').toLowerCase()
+          if (!providerState.has(providerId)) {
+            sendJson(ws, { type: 'error', message: `Unknown provider: ${providerId}` })
+            return
+          }
+          const enabled = Boolean(message.enabled)
+          providerState.set(providerId, { id: providerId, enabled })
+          const debugConfig = normalizeTtsNodeConfig(message.tts || null, message.lang || 'es-AR')
+          const debugStatus = await getTtsDebugSnapshot(debugConfig)
+          sendJson(ws, { type: 'providers_status', data: debugStatus.ttsProviders })
+          sendJson(ws, { type: 'debug_status', data: debugStatus })
+          return
+        }
+
+        if (message.type === 'node_config_get') {
+          const providerId = String(message.provider || TTS_PROVIDER).toLowerCase()
+          try {
+            const data = await getNodeConfig(providerId)
+            sendJson(ws, { type: 'node_config_status', provider: providerId, data })
+          } catch (error) {
+            sendJson(ws, {
+              type: 'error',
+              message: error instanceof Error ? error.message : 'node_config_get failed',
+            })
+          }
+          return
+        }
+
+        if (message.type === 'node_config_set') {
+          const providerId = String(message.provider || TTS_PROVIDER).toLowerCase()
+          try {
+            const data = await updateNodeConfig(providerId, message.config || {})
+            sendJson(ws, { type: 'node_config_status', provider: providerId, data })
+            const debugConfig = normalizeTtsNodeConfig(message.tts || null, message.lang || 'es-AR')
+            const debugStatus = await getTtsDebugSnapshot(debugConfig)
+            sendJson(ws, { type: 'debug_status', data: debugStatus })
+          } catch (error) {
+            sendJson(ws, {
+              type: 'error',
+              message: error instanceof Error ? error.message : 'node_config_set failed',
+            })
+          }
+          return
+        }
+
+        if (message.type === 'node_ephemeral_set') {
+          const providerId = String(message.provider || TTS_PROVIDER).toLowerCase()
+          try {
+            const payload = {
+              instance: message.instance || {},
+              ttl_seconds: Number(message.ttl_seconds || 900),
+            }
+            const data = await setNodeEphemeral(providerId, payload)
+            sendJson(ws, { type: 'node_config_status', provider: providerId, data })
+            const debugConfig = normalizeTtsNodeConfig(message.tts || null, message.lang || 'es-AR')
+            const debugStatus = await getTtsDebugSnapshot(debugConfig)
+            sendJson(ws, { type: 'debug_status', data: debugStatus })
+          } catch (error) {
+            sendJson(ws, {
+              type: 'error',
+              message: error instanceof Error ? error.message : 'node_ephemeral_set failed',
+            })
+          }
+          return
+        }
+
+        if (message.type === 'node_ephemeral_clear') {
+          const providerId = String(message.provider || TTS_PROVIDER).toLowerCase()
+          try {
+            const data = await clearNodeEphemeral(providerId)
+            sendJson(ws, { type: 'node_config_status', provider: providerId, data })
+            const debugConfig = normalizeTtsNodeConfig(message.tts || null, message.lang || 'es-AR')
+            const debugStatus = await getTtsDebugSnapshot(debugConfig)
+            sendJson(ws, { type: 'debug_status', data: debugStatus })
+          } catch (error) {
+            sendJson(ws, {
+              type: 'error',
+              message: error instanceof Error ? error.message : 'node_ephemeral_clear failed',
+            })
+          }
+          return
+        }
+
         if (message.type !== 'audio_meta') {
           sendJson(ws, { type: 'error', message: `Unsupported message type: ${message.type}` })
           return
@@ -413,6 +877,7 @@ wss.on('connection', (ws, req) => {
           requestId: message.requestId || randomUUID(),
           lang: message.lang || 'es-AR',
           mime: message.mime || 'application/octet-stream',
+          tts: message.tts || null,
         }
         return
       }

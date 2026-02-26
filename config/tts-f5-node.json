@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "default_instance_by_lang": {
+    "es": "f5-es-default",
+    "en": "f5-en-default"
+  },
+  "instances": [
+    {
+      "id": "f5-es-default",
+      "lang": "es",
+      "enabled": true,
+      "model_id": "jpgallegoar/F5-Spanish",
+      "model_local_path": null,
+      "ref_audio": "/app/voices/es/reference.wav",
+      "ref_text": ""
+    },
+    {
+      "id": "f5-en-default",
+      "lang": "en",
+      "enabled": false,
+      "model_id": "jpgallegoar/F5-Spanish",
+      "model_local_path": null,
+      "ref_audio": "",
+      "ref_text": ""
+    }
+  ],
+  "ephemeral": {
+    "active": false,
+    "expires_at": null,
+    "instance": null
+  }
+}

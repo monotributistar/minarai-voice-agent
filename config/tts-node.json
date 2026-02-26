@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "provider": "local",
+  "default_instance_by_lang": {
+    "es": "es_ES-sharvard-medium",
+    "en": "en_US-joe-medium"
+  },
+  "instances": [
+    {
+      "id": "es_ES-sharvard-medium",
+      "lang": "es",
+      "provider": "local",
+      "enabled": true,
+      "model_path": "/app/voices/es/es_ES-sharvard-medium.onnx"
+    },
+    {
+      "id": "en_US-joe-medium",
+      "lang": "en",
+      "provider": "local",
+      "enabled": true,
+      "model_path": "/app/voices/en/en_US-joe-medium.onnx"
+    },
+    {
+      "id": "groq-default",
+      "lang": "en",
+      "provider": "groq",
+      "enabled": true,
+      "model": "playai-tts",
+      "provider_voice": "Fritz-PlayAI"
+    }
+  ],
+  "ephemeral": {
+    "active": false,
+    "expires_at": null,
+    "instance": null
+  }
+}

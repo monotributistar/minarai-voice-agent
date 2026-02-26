@@ -58,4 +58,19 @@ services:
       - "9002:9002"
     volumes:
       - ./tts/voices:/app/voices
+      - ./config:/app/config
+    restart: unless-stopped
+
+  tts-f5:
+    profiles: ["f5"]
+    build:
+      context: ./tts-f5
+      dockerfile: Dockerfile
+    env_file:
+      - ./.env
+    ports:
+      - "9003:9003"
+    volumes:
+      - ./tts-f5/voices:/app/voices
+      - ./config:/app/config
     restart: unless-stopped
